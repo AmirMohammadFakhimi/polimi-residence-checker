@@ -409,6 +409,36 @@ def visible_now(locator):
     return None
 
 
+def declaration_yes_control(page, heading_name):
+    """Return the attached YES radio for a visible declaration page."""
+    heading = visible_now(page.get_by_role("heading", name=heading_name))
+    if heading is None:
+        return None
+
+    yes_options = page.locator(
+        'input#PRESA_VISIONE_S[name="PRESA_VISIONE"][value="S"]'
+    )
+    if yes_options.count() != 1:
+        return None
+
+    # SOL hides the native radio and makes its label the visible control.
+    # Requiring both avoids matching an unrelated hidden input.
+    yes_label = page.locator('label[for="PRESA_VISIONE_S"]')
+    if visible_now(yes_label) is None:
+        return None
+
+    save_buttons = page.get_by_role(
+        "button",
+        name=re.compile(
+            r"(?:Salva e Continua|Save\s*&\s*Continue)",
+            re.IGNORECASE,
+        ),
+    )
+    if visible_now(save_buttons) is None:
+        return None
+    return yes_options.first
+
+
 def click_language_if_present(page, names):
     locator = page.get_by_role("link", name=re.compile(names, re.IGNORECASE))
     for index in range(locator.count()):
@@ -743,33 +773,14 @@ def availability_table_signature(table):
 
 
 def residence_notice_yes_control(page):
-    heading = visible_now(
-        page.get_by_role(
-            "heading",
-            name=re.compile(
-                r"^University residences\s*-\s*"
-                r"Details of the university residences$",
-                re.IGNORECASE,
-            ),
-        )
+    return declaration_yes_control(
+        page,
+        re.compile(
+            r"^University residences\s*-\s*"
+            r"Details of the university residences$",
+            re.IGNORECASE,
+        ),
     )
-    if heading is None:
-        return None
-
-    yes_options = page.locator(
-        'input#PRESA_VISIONE_S[name="PRESA_VISIONE"][value="S"]'
-    )
-    yes = visible_now(yes_options)
-    if yes is None:
-        return None
-
-    save_buttons = page.get_by_role(
-        "button",
-        name=re.compile(r"^Save\s*&\s*Continue$", re.IGNORECASE),
-    )
-    if visible_now(save_buttons) is None:
-        return None
-    return yes
 
 
 def wait_for_booking_state(page, timeout_seconds=BOOKING_PAGE_TIMEOUT_SECONDS):
@@ -789,25 +800,11 @@ def wait_for_booking_state(page, timeout_seconds=BOOKING_PAGE_TIMEOUT_SECONDS):
             if residence_notice_yes is not None:
                 return "residence_notice", residence_notice_yes
 
-            privacy_options = page.locator("#PRESA_VISIONE_S")
-            privacy_heading = visible_now(
-                page.get_by_role(
-                    "heading", name=re.compile(r"privacy", re.IGNORECASE)
-                )
+            privacy_yes = declaration_yes_control(
+                page,
+                re.compile(r"Privacy", re.IGNORECASE),
             )
-            save_button = visible_now(
-                page.get_by_role(
-                    "button",
-                    name=re.compile(
-                        r"(Salva e Continua|Save\s*&\s*Continue)",
-                        re.IGNORECASE,
-                    ),
-                )
-            )
-            privacy_yes = visible_now(privacy_options)
-            if privacy_yes is not None and (
-                privacy_heading is not None or save_button is not None
-            ):
+            if privacy_yes is not None:
                 return "privacy", privacy_yes
         except PlaywrightError as error:
             # The portal replaces sections while its AJAX requests finish.
@@ -985,7 +982,7 @@ def open_availability_table(page):
             save_buttons = page.get_by_role(
                 "button",
                 name=re.compile(
-                    r"^Save\s*&\s*Continue$",
+                    r"Save\s*&\s*Continue",
                     re.IGNORECASE,
                 ),
             )
