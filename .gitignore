@@ -1,0 +1,81 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Checker runtime state
+.bot_state.json
+.bot_state.corrupt-*.json
+*.log
+*.pid
+*.pid.lock
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# Node.js and PM2 local data
+node_modules/
+.pm2/
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# macOS and iCloud
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+*.icloud
+
+# Ubuntu and other Linux desktops
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Local notes and transfer archives
+links.rtf
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
