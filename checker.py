@@ -29,8 +29,7 @@ ENV_VALUES = dotenv_values(ROOT / ".env")
 BOT_STATE_PATH = ROOT / ".bot_state.json"
 
 PORTAL_URL = "https://polimi-sol.dirittoallostudio.it/apps/V3.1/sol/public/index.php"
-ACADEMIC_YEAR = "2026/2027"
-YEAR_PANEL = "#aa2026"
+DEFAULT_ACADEMIC_YEAR = "2026/2027"
 TEHRAN_TIMEZONE = ZoneInfo("Asia/Tehran")
 TEHRAN_CHECK_HOURS = (9, 21)
 TELEGRAM_MAX_ATTEMPTS = 3
@@ -73,6 +72,10 @@ def setting(name, default=""):
 POLIMI_USERNAME = setting("POLIMI_USERNAME").strip()
 POLIMI_PASSWORD = setting("POLIMI_PASSWORD")
 POLIMI_TOTP_URI = setting("POLIMI_TOTP_URI").strip()
+ACADEMIC_YEAR = setting(
+    "ACADEMIC_YEAR",
+    DEFAULT_ACADEMIC_YEAR,
+).strip()
 TELEGRAM_BOT_TOKEN = setting("TELEGRAM_BOT_TOKEN").strip()
 TELEGRAM_CHAT_ID = setting("TELEGRAM_CHAT_ID").strip()
 CHECK_INTERVAL_HOURS = setting("CHECK_INTERVAL_HOURS", "12").strip()
@@ -107,6 +110,20 @@ def boolean_setting(name, value):
     if normalized in ("false", "0", "no", "off"):
         return False
     raise CheckerError(f"{name} must be true or false.")
+
+
+def academic_year_start(value):
+    match = re.fullmatch(r"([0-9]{4})/([0-9]{4})", value)
+    if match is None or int(match.group(2)) != int(match.group(1)) + 1:
+        raise CheckerError(
+            "ACADEMIC_YEAR must contain consecutive years in YYYY/YYYY "
+            "format, for example 2026/2027."
+        )
+    return match.group(1)
+
+
+def academic_year_panel(value):
+    return f"#aa{academic_year_start(value)}"
 
 
 @contextmanager
@@ -502,7 +519,7 @@ def sol_login_cards(page):
 
 
 def sol_page_state(page):
-    if page.locator(YEAR_PANEL).count() > 0:
+    if page.locator(academic_year_panel(ACADEMIC_YEAR)).count() > 0:
         return "authenticated"
     if visible_now(page.locator("input#login")) is not None:
         return "sso"
@@ -869,8 +886,8 @@ def open_availability_table(page):
         INCLUDE_RESIDENCE_NOTICE_PAGE_VALUE,
     )
 
-    with browser_stage("opening the 2026/2027 section"):
-        panel = page.locator(YEAR_PANEL).first
+    with browser_stage(f"opening the {ACADEMIC_YEAR} section"):
+        panel = page.locator(academic_year_panel(ACADEMIC_YEAR)).first
         panel.wait_for(state="attached", timeout=30_000)
 
         # English was selected on the landing page before LOGIN. Verify that the
@@ -895,7 +912,7 @@ def open_availability_table(page):
         )
         full_rate_heading = only_visible(
             panel.get_by_role("heading", name=full_rate_name),
-            "2026/2027 full-rate accommodation section",
+            f"{ACADEMIC_YEAR} full-rate accommodation section",
         )
         full_rate_section = full_rate_heading.locator(
             'xpath=ancestor::div['
@@ -1838,6 +1855,8 @@ def configuration(use_start_hour=True):
         raise CheckerError(
             "Set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or leave both empty."
         )
+
+    academic_year_start(ACADEMIC_YEAR)
 
     boolean_setting(
         "INCLUDE_RESIDENCE_NOTICE_PAGE",
