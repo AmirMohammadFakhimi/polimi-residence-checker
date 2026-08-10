@@ -4,8 +4,8 @@ An unofficial Python service that checks Polimi student-residence availability
 and sends Telegram alerts.
 
 It supports scheduled and on-demand checks, configurable academic years,
-per-residence monitoring, a button-based Telegram interface, and continuous
-operation with PM2.
+per-user residence monitoring and notification schedules, a button-based
+Telegram interface, and continuous operation with PM2.
 
 > [!IMPORTANT]
 > This project is not affiliated with or endorsed by Politecnico di Milano.
@@ -23,7 +23,12 @@ The checker:
 - Handles the required declaration pages.
 - Reads every room count from the English availability table.
 - Sends distinct Telegram messages based on the result.
-- Allows residences to be monitored or summarized through Telegram buttons.
+- Registers people who start the bot and stores separate preferences for each.
+- Allows each person to monitor or summarize residences through Telegram buttons.
+- Lets each person turn scheduled alerts on/off and select a multiple of the
+  global check interval without adding website checks.
+- Sends scheduled results to configured administrators immediately and can
+  delay delivery to other subscribers.
 - Supports interval-based and fixed Tehran-time schedules.
 - Explicitly logs out after each check.
 - Reports configuration, browser, portal-flow, table, and logout failures.
@@ -64,7 +69,11 @@ table directly. The checker accepts that path as well.
 - Scheduled checks with stable start-to-start timing
 - Fixed 09:00 and 21:00 Tehran schedule
 - On-demand checks from Telegram
-- Button-based residence monitoring
+- Multiple administrator chat IDs
+- Per-user residence monitoring
+- Per-user scheduled notification on/off setting
+- Per-user interval multiples with no extra SOL checks
+- Optional delayed subscriber delivery
 - Detailed monitored-room alerts
 - Accumulated totals for unmonitored residences
 - Clickable SOL link in urgent alerts
@@ -80,7 +89,7 @@ table directly. The checker accepts that path as well.
 - Chromium installed through Playwright
 - An accurately synchronized system clock
 - A Polimi account with TOTP authentication
-- A Telegram bot and private chat ID for Telegram features
+- A Telegram bot and at least one administrator private-chat ID for Telegram features
 - Node.js and PM2 for optional continuous server operation
 
 ## Project files
@@ -94,9 +103,10 @@ table directly. The checker accepts that path as well.
 | `.gitignore` | Excludes secrets, state, caches, logs, OS files, and IDE files |
 | `.bot_state.json` | Automatically created local bot state |
 
-`.bot_state.json` contains the learned residence catalog, monitoring
-preferences, Telegram interface version, and processed-update offset. It does
-not contain Polimi credentials or the Telegram bot token.
+`.bot_state.json` contains the learned residence catalog, registered private
+chats, their monitoring and delivery preferences, Telegram interface versions,
+and the processed-update offset. It does not contain Polimi credentials or the
+Telegram bot token.
 
 ## Installation
 
@@ -162,28 +172,34 @@ ACADEMIC_YEAR=2026/2027
 # Schedule
 CHECK_START_HOUR=9
 CHECK_INTERVAL_HOURS=12
+SUBSCRIBER_NOTIFICATIONS_ENABLED=true
+DELAYED_NOTIFICATIONS_ENABLED=true
+NOTIFICATION_DELAY_MINUTES=5
 INCLUDE_RESIDENCE_NOTICE_PAGE=true
 
 # Telegram
 TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
+TELEGRAM_CHAT_IDS=
 ```
 
 ### Configuration reference
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `POLIMI_USERNAME` | Yes | Polimi person code |
-| `POLIMI_PASSWORD` | Yes | Polimi account password |
-| `POLIMI_TOTP_URI` | Yes | Complete `otpauth://totp/...` URI |
-| `ACADEMIC_YEAR` | No | Target year in consecutive `YYYY/YYYY` format; default `2026/2027` |
-| `CHECK_START_HOUR` | No | Tehran-time anchor for interval mode; blank means check immediately at startup |
-| `CHECK_INTERVAL_HOURS` | No | Hours between scheduled starts; default `12` |
-| `INCLUDE_RESIDENCE_NOTICE_PAGE` | No | Allow the additional University residences declaration; default `true` |
-| `TELEGRAM_BOT_TOKEN` | No | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | No | Authorized numeric private-chat ID |
+| Variable                        | Required | Description                                                                                                |
+|---------------------------------|----------|------------------------------------------------------------------------------------------------------------|
+| `POLIMI_USERNAME`               | Yes      | Polimi person code                                                                                         |
+| `POLIMI_PASSWORD`               | Yes      | Polimi account password                                                                                    |
+| `POLIMI_TOTP_URI`               | Yes      | Complete `otpauth://totp/...` URI                                                                          |
+| `ACADEMIC_YEAR`                 | No       | Target year in consecutive `YYYY/YYYY` format; default `2026/2027`                                         |
+| `CHECK_START_HOUR`              | No       | Tehran-time anchor for interval mode; blank means check immediately at startup                             |
+| `CHECK_INTERVAL_HOURS`          | No       | Hours between scheduled starts; default `12`                                                               |
+| `SUBSCRIBER_NOTIFICATIONS_ENABLED` | No    | `false` suppresses all notifications to chats outside `TELEGRAM_CHAT_IDS`; default `true`                  |
+| `DELAYED_NOTIFICATIONS_ENABLED` | No       | `true` delays non-administrator notifications; `false` sends due notifications immediately; default `true` |
+| `NOTIFICATION_DELAY_MINUTES`    | No       | Delay for non-administrator notifications; finite number of minutes, zero or more; default `5`             |
+| `INCLUDE_RESIDENCE_NOTICE_PAGE` | No       | Allow the additional University residences declaration; default `true`                                     |
+| `TELEGRAM_BOT_TOKEN`            | No       | Telegram bot token                                                                                         |
+| `TELEGRAM_CHAT_IDS`             | No       | Comma-separated administrator numeric private-chat IDs                                                     |
 
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` must either both be set or both be
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_IDS` must either both be set or both be
 left blank.
 
 ### Academic year
@@ -300,6 +316,12 @@ and takes five minutes, the next start remains 10:00. If a check takes longer
 than an entire interval, missed starts are skipped rather than executed in a
 burst.
 
+Each Telegram user can select a positive whole-number multiplier of this global
+interval. For example, with `CHECK_INTERVAL_HOURS=2`, a user selecting `3×`
+is due every third completed scheduled check, or every six hours. This changes
+only delivery frequency: it never starts an additional SOL check. A changed
+multiplier begins a fresh personal cycle.
+
 ### Tehran mode
 
 `--mode tehran` runs at:
@@ -314,13 +336,20 @@ This mode ignores `CHECK_START_HOUR`.
 ### Setup
 
 1. Create a bot using Telegram's BotFather.
-2. Open a private chat with the bot.
-3. Press Telegram's built-in **Start** button once.
-4. Obtain the bot token and numeric private-chat ID.
-5. Add both values to `.env`.
+2. Have every intended recipient open a private chat with the bot and press
+   Telegram's built-in **Start** button once.
+3. Obtain the bot token and numeric private-chat IDs for the administrators.
+4. Add the token and comma-separated administrator IDs to `.env`.
 
-Group chats are not supported by the button interface. Incoming actions are
-checked against both the configured chat and sender.
+For example:
+
+```dotenv
+TELEGRAM_CHAT_IDS=123456789,987654321
+```
+
+Group chats are not supported. Private-chat actions are checked against the
+sender, and each person is stored after interacting with the bot. Telegram does
+not expose a list of people who have not interacted with the running service.
 
 If Telegram is not configured, results remain available in the terminal or
 PM2 logs.
@@ -329,8 +358,11 @@ PM2 logs.
 
 The bot uses buttons instead of typed commands:
 
-- `🔎 Check now`: runs a fresh check and always sends the result.
+- `🔎 Check now`: runs a fresh check and always sends the result; visible only
+  to configured administrators.
 - `🏘 Manage residences`: shows the complete residence list.
+- `⚙️ Notification settings`: turns scheduled alerts on/off and changes the
+  user's interval multiplier.
 - `ℹ️ Help`: explains the available controls.
 
 The residence manager supports:
@@ -339,13 +371,36 @@ The residence manager supports:
 - `▫️ Total only`: include only one accumulated total for the residence.
 - `✅ Monitor all`: mark every known residence as monitored.
 - `📊 Totals only`: mark every known residence as unmonitored.
-- `🔄 Refresh list from SOL`: reload the complete English residence list.
+- `🔄 Refresh list from SOL`: reload the complete English residence list;
+  available only to configured administrators.
 
 If the bot has not learned the residence catalog yet, opening the residence
-manager performs one read-only SOL check first. Newly discovered residences
-default to monitored.
+manager as an administrator performs one read-only SOL check first. Other users
+are asked to wait for the next scheduled check. Newly discovered residences
+default to monitored for every user.
 
 Duplicate taps for the same pending check or refresh are combined.
+
+### Scheduled delivery
+
+One SOL check produces one shared availability result. The bot then renders
+that result separately for each due recipient using that person's monitored
+residences.
+
+- Configured administrators receive due scheduled availability alerts first.
+- With `SUBSCRIBER_NOTIFICATIONS_ENABLED=false`, nobody outside
+  `TELEGRAM_CHAT_IDS` receives notifications, regardless of personal settings.
+- Other enabled users receive due alerts after `NOTIFICATION_DELAY_MINUTES`
+  when `DELAYED_NOTIFICATIONS_ENABLED=true`.
+- With `DELAYED_NOTIFICATIONS_ENABLED=false`, all due alerts are sent
+  immediately after the same check.
+- A user's on/off setting and interval affect scheduled availability alerts.
+  Controls remain usable while alerts are off.
+- Failures are sent to configured administrators; automatic zero-availability
+  checks remain silent, as before.
+
+The delay runs independently from the website checker and Telegram controls.
+It does not delay the next SOL check or create another one.
 
 ### Notification types
 
@@ -451,13 +506,17 @@ The bot creates `.bot_state.json` automatically with permission `600`. It
 stores:
 
 - Known residence names
-- Monitored/unmonitored preferences
-- Telegram interface version
+- Registered user chat IDs, names, and usernames
+- Per-user on/off state, interval multiplier, and delivery-cycle position
+- Per-user monitored/unmonitored preferences
+- Per-user Telegram interface version
 - Last processed Telegram update
 
 Keep this file when updating an installation. Deleting it is safe, but resets
-the residence catalog and monitoring preferences. All residences default to
-monitored after the next successful check.
+the registered-user list, residence catalog, and monitoring preferences.
+Configured administrators are recreated at startup; other users must press
+**Start** again. All residences default to monitored after the next successful
+check.
 
 ## Logging and failures
 

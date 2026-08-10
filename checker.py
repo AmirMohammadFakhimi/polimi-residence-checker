@@ -40,9 +40,10 @@ TELEGRAM_POLL_NETWORK_TIMEOUT = 35
 TELEGRAM_POLL_RETRY_SECONDS = 5
 TELEGRAM_DUPLICATE_POLL_SECONDS = 1
 TELEGRAM_ACTION_QUEUE_LIMIT = 50
-TELEGRAM_UI_VERSION = 1
+TELEGRAM_UI_VERSION = 2
 BUTTON_CHECK_NOW = "🔎 Check now"
 BUTTON_MANAGE_RESIDENCES = "🏘 Manage residences"
+BUTTON_NOTIFICATION_SETTINGS = "⚙️ Notification settings"
 BUTTON_HELP = "ℹ️ Help"
 NOTIFICATION_DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 PORTAL_LOAD_ATTEMPTS = 3
@@ -51,9 +52,7 @@ BOOKING_PAGE_TIMEOUT_SECONDS = 60
 TABLE_STABLE_SECONDS = 2
 LOGOUT_VERIFY_ATTEMPTS = 3
 LOGOUT_STATE_STABLE_SECONDS = 3
-ROOM_COUNT_PATTERN = re.compile(
-    r"^\s*(\d+)\s*(?:Post[oi]|Rooms?)\s*$", re.IGNORECASE
-)
+ROOM_COUNT_PATTERN = re.compile(r"^\s*(\d+)\s*(?:Post[oi]|Rooms?)\s*$", re.IGNORECASE)
 BOT_STATE_LOCK = threading.Lock()
 CHECK_ACTION_LOCK = threading.Lock()
 PENDING_SOL_ACTIONS = set()
@@ -69,6 +68,17 @@ def setting(name, default=""):
     return default if value is None else str(value)
 
 
+def split_telegram_chat_ids(*values):
+    chat_ids = []
+    seen = set()
+    for value in values:
+        for chat_id in re.split(r"[\s,;]+", value.strip()):
+            if chat_id and chat_id not in seen:
+                chat_ids.append(chat_id)
+                seen.add(chat_id)
+    return tuple(chat_ids)
+
+
 POLIMI_USERNAME = setting("POLIMI_USERNAME").strip()
 POLIMI_PASSWORD = setting("POLIMI_PASSWORD")
 POLIMI_TOTP_URI = setting("POLIMI_TOTP_URI").strip()
@@ -77,9 +87,23 @@ ACADEMIC_YEAR = setting(
     DEFAULT_ACADEMIC_YEAR,
 ).strip()
 TELEGRAM_BOT_TOKEN = setting("TELEGRAM_BOT_TOKEN").strip()
-TELEGRAM_CHAT_ID = setting("TELEGRAM_CHAT_ID").strip()
+TELEGRAM_CHAT_IDS = split_telegram_chat_ids(
+    setting("TELEGRAM_CHAT_IDS"),
+)
 CHECK_INTERVAL_HOURS = setting("CHECK_INTERVAL_HOURS", "12").strip()
 CHECK_START_HOUR = setting("CHECK_START_HOUR").strip()
+DELAYED_NOTIFICATIONS_ENABLED_VALUE = setting(
+    "DELAYED_NOTIFICATIONS_ENABLED",
+    "true",
+).strip()
+SUBSCRIBER_NOTIFICATIONS_ENABLED_VALUE = setting(
+    "SUBSCRIBER_NOTIFICATIONS_ENABLED",
+    "true",
+).strip()
+NOTIFICATION_DELAY_MINUTES = setting(
+    "NOTIFICATION_DELAY_MINUTES",
+    "5",
+).strip()
 INCLUDE_RESIDENCE_NOTICE_PAGE_VALUE = setting(
     "INCLUDE_RESIDENCE_NOTICE_PAGE",
     "true",
@@ -91,7 +115,7 @@ for secret_name in (
     "POLIMI_PASSWORD",
     "POLIMI_TOTP_URI",
     "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
+    "TELEGRAM_CHAT_IDS",
     "DEBUG",
     "PWDEBUG",
     "SSLKEYLOGFILE",
@@ -110,6 +134,32 @@ def boolean_setting(name, value):
     if normalized in ("false", "0", "no", "off"):
         return False
     raise CheckerError(f"{name} must be true or false.")
+
+
+def delayed_notifications_enabled():
+    return boolean_setting(
+        "DELAYED_NOTIFICATIONS_ENABLED",
+        DELAYED_NOTIFICATIONS_ENABLED_VALUE,
+    )
+
+
+def subscriber_notifications_enabled():
+    return boolean_setting(
+        "SUBSCRIBER_NOTIFICATIONS_ENABLED",
+        SUBSCRIBER_NOTIFICATIONS_ENABLED_VALUE,
+    )
+
+
+def notification_delay_minutes():
+    try:
+        minutes = float(NOTIFICATION_DELAY_MINUTES)
+    except ValueError as error:
+        raise CheckerError("NOTIFICATION_DELAY_MINUTES must be a number.") from error
+    if not math.isfinite(minutes) or minutes < 0:
+        raise CheckerError(
+            "NOTIFICATION_DELAY_MINUTES must be a finite number of zero or more."
+        )
+    return minutes
 
 
 def academic_year_start(value):
@@ -131,9 +181,7 @@ def browser_stage(description):
     try:
         yield
     except PlaywrightError as error:
-        raise CheckerError(
-            f"Browser automation failed while {description}."
-        ) from error
+        raise CheckerError(f"Browser automation failed while {description}.") from error
 
 
 def log(message):
@@ -143,11 +191,23 @@ def log(message):
 
 def default_bot_state():
     return {
-        "schema": 1,
+        "schema": 2,
         "telegram_offset": 0,
-        "telegram_ui_version": 0,
         "known_residences": [],
+        "users": {},
+    }
+
+
+def default_user_state():
+    return {
+        "name": "",
+        "username": "",
+        "started_at": "",
+        "enabled": True,
+        "interval_multiplier": 1,
+        "scheduled_checks": 0,
         "unwatched_residences": [],
+        "telegram_ui_version": 0,
     }
 
 
@@ -166,10 +226,52 @@ def unique_text_list(values):
     return unique
 
 
+def normalized_user_state(raw_user):
+    user = default_user_state()
+    if not isinstance(raw_user, dict):
+        return user
+
+    for field in ("name", "username", "started_at"):
+        value = raw_user.get(field)
+        if isinstance(value, str):
+            user[field] = clean_text(value)
+
+    enabled = raw_user.get("enabled")
+    if isinstance(enabled, bool):
+        user["enabled"] = enabled
+
+    multiplier = raw_user.get("interval_multiplier")
+    if (
+        isinstance(multiplier, int)
+        and not isinstance(multiplier, bool)
+        and multiplier > 0
+    ):
+        user["interval_multiplier"] = multiplier
+
+    scheduled_checks = raw_user.get("scheduled_checks")
+    if (
+        isinstance(scheduled_checks, int)
+        and not isinstance(scheduled_checks, bool)
+        and scheduled_checks >= 0
+    ):
+        user["scheduled_checks"] = min(
+            scheduled_checks,
+            user["interval_multiplier"] - 1,
+        )
+
+    user["unwatched_residences"] = unique_text_list(
+        raw_user.get("unwatched_residences", [])
+    )
+    ui_version = raw_user.get("telegram_ui_version")
+    if isinstance(ui_version, int) and ui_version >= 0:
+        user["telegram_ui_version"] = ui_version
+    return user
+
+
 def read_bot_state_unlocked():
     try:
         raw_state = json.loads(BOT_STATE_PATH.read_text(encoding="utf-8"))
-        if not isinstance(raw_state, dict):
+        if not isinstance(raw_state, dict) or raw_state.get("schema") != 2:
             raise ValueError
     except FileNotFoundError:
         return default_bot_state()
@@ -199,15 +301,13 @@ def read_bot_state_unlocked():
     offset = raw_state.get("telegram_offset", 0)
     if isinstance(offset, int) and offset >= 0:
         state["telegram_offset"] = offset
-    ui_version = raw_state.get("telegram_ui_version", 0)
-    if isinstance(ui_version, int) and ui_version >= 0:
-        state["telegram_ui_version"] = ui_version
-    state["known_residences"] = unique_text_list(
-        raw_state.get("known_residences", [])
-    )
-    state["unwatched_residences"] = unique_text_list(
-        raw_state.get("unwatched_residences", [])
-    )
+    state["known_residences"] = unique_text_list(raw_state.get("known_residences", []))
+    raw_users = raw_state.get("users", {})
+    if isinstance(raw_users, dict):
+        for chat_id, raw_user in raw_users.items():
+            if isinstance(chat_id, str) and re.fullmatch(r"-?[0-9]+", chat_id):
+                state["users"][chat_id] = normalized_user_state(raw_user)
+
     return state
 
 
@@ -219,11 +319,53 @@ def write_bot_state_unlocked(state):
     os.replace(temporary_path, BOT_STATE_PATH)
 
 
-def residence_preferences():
+def ensure_admin_users():
+    if not TELEGRAM_CHAT_IDS:
+        return
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+        changed = False
+        for chat_id in TELEGRAM_CHAT_IDS:
+            if chat_id not in state["users"]:
+                state["users"][chat_id] = default_user_state()
+                changed = True
+        if changed:
+            write_bot_state_unlocked(state)
+
+
+def register_telegram_user(chat_id, source):
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+        is_new = chat_id not in state["users"]
+        user = state["users"].setdefault(chat_id, default_user_state())
+        if is_new:
+            user["started_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
+
+        first_name = source.get("first_name")
+        last_name = source.get("last_name")
+        name_parts = [
+            clean_text(value)
+            for value in (first_name, last_name)
+            if isinstance(value, str) and clean_text(value)
+        ]
+        username = source.get("username")
+        name = " ".join(name_parts)
+        if name:
+            user["name"] = name
+        if isinstance(username, str):
+            user["username"] = clean_text(username)
+        write_bot_state_unlocked(state)
+    return is_new
+
+
+def residence_preferences(chat_id):
     with BOT_STATE_LOCK:
         state = read_bot_state_unlocked()
     catalog = state["known_residences"]
-    unwatched = set(state["unwatched_residences"])
+    user = state["users"].get(chat_id, default_user_state())
+    unwatched = set(user["unwatched_residences"])
     watched = [name for name in catalog if name not in unwatched]
     return catalog, watched
 
@@ -234,36 +376,95 @@ def refresh_residence_catalog(residences):
         state = read_bot_state_unlocked()
         state["known_residences"] = catalog
         write_bot_state_unlocked(state)
-    unwatched = set(state["unwatched_residences"])
-    return {name for name in catalog if name not in unwatched}
+    return catalog
 
 
-def update_residence_watch(numbers, should_watch):
+def update_residence_watch(chat_id, numbers, should_watch):
     with BOT_STATE_LOCK:
         state = read_bot_state_unlocked()
         catalog = state["known_residences"]
         selected = [catalog[number - 1] for number in numbers]
-        unwatched = set(state["unwatched_residences"])
+        user = state["users"].setdefault(chat_id, default_user_state())
+        unwatched = set(user["unwatched_residences"])
         for residence in selected:
             if should_watch:
                 unwatched.discard(residence)
             else:
                 unwatched.add(residence)
-        state["unwatched_residences"] = sorted(unwatched)
+        user["unwatched_residences"] = sorted(unwatched)
         write_bot_state_unlocked(state)
 
     watched = [name for name in catalog if name not in unwatched]
     return catalog, watched
 
 
-def update_all_residence_watches(should_watch):
+def update_all_residence_watches(chat_id, should_watch):
     with BOT_STATE_LOCK:
         state = read_bot_state_unlocked()
         catalog = state["known_residences"]
-        state["unwatched_residences"] = [] if should_watch else list(catalog)
+        user = state["users"].setdefault(chat_id, default_user_state())
+        user["unwatched_residences"] = [] if should_watch else list(catalog)
         write_bot_state_unlocked(state)
     watched = list(catalog) if should_watch else []
     return catalog, watched
+
+
+def user_notification_settings(chat_id):
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+    user = state["users"].get(chat_id, default_user_state())
+    return user["enabled"], user["interval_multiplier"]
+
+
+def set_user_notifications_enabled(chat_id, enabled):
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+        user = state["users"].setdefault(chat_id, default_user_state())
+        user["enabled"] = enabled
+        user["scheduled_checks"] = 0
+        write_bot_state_unlocked(state)
+
+
+def set_user_interval_multiplier(chat_id, multiplier):
+    if (
+        not isinstance(multiplier, int)
+        or isinstance(multiplier, bool)
+        or multiplier < 1
+    ):
+        raise ValueError("The interval multiplier must be a positive integer.")
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+        user = state["users"].setdefault(chat_id, default_user_state())
+        user["interval_multiplier"] = multiplier
+        user["scheduled_checks"] = 0
+        write_bot_state_unlocked(state)
+
+
+def advance_scheduled_recipients():
+    due_admins = []
+    due_subscribers = []
+    admin_chat_ids = set(TELEGRAM_CHAT_IDS)
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+        for chat_id, user in state["users"].items():
+            if not user["enabled"]:
+                continue
+            user["scheduled_checks"] += 1
+            if user["scheduled_checks"] >= user["interval_multiplier"]:
+                user["scheduled_checks"] = 0
+                if chat_id in admin_chat_ids:
+                    due_admins.append(chat_id)
+                else:
+                    due_subscribers.append(chat_id)
+        write_bot_state_unlocked(state)
+    return due_admins, due_subscribers
+
+
+def user_notifications_enabled(chat_id):
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+    user = state["users"].get(chat_id)
+    return bool(user and user["enabled"])
 
 
 def telegram_update_offset():
@@ -312,36 +513,39 @@ def mark_telegram_update_processed(update_id):
         )
 
 
-def telegram_ui_version():
-    with BOT_STATE_LOCK:
-        return read_bot_state_unlocked()["telegram_ui_version"]
-
-
-def save_telegram_ui_version(version):
+def telegram_ui_version(chat_id):
     with BOT_STATE_LOCK:
         state = read_bot_state_unlocked()
-        state["telegram_ui_version"] = max(
-            state["telegram_ui_version"], version
-        )
+    user = state["users"].get(chat_id, default_user_state())
+    return user["telegram_ui_version"]
+
+
+def save_telegram_ui_version(chat_id, version):
+    with BOT_STATE_LOCK:
+        state = read_bot_state_unlocked()
+        user = state["users"].setdefault(chat_id, default_user_state())
+        user["telegram_ui_version"] = max(user["telegram_ui_version"], version)
         write_bot_state_unlocked(state)
 
 
 def sol_check_action_key(action):
-    if not isinstance(action, dict):
+    if not isinstance(action, dict) or not action.get("is_admin"):
         return None
     if action.get("kind") == "message":
         if action.get("action") == "check":
             return "check"
         if action.get("action") != "residences":
             return None
-        catalog, _ = residence_preferences()
+        catalog, _ = residence_preferences(action["chat_id"])
         return "discovery" if not catalog else None
     if action.get("kind") != "callback":
         return None
     callback = parse_residence_callback(action.get("data", ""))
     if callback is not None and callback["target"] == "refresh":
         return "refresh"
-    catalog, _ = residence_preferences()
+    if callback is None:
+        return None
+    catalog, _ = residence_preferences(action["chat_id"])
     return "discovery" if not catalog else None
 
 
@@ -415,9 +619,7 @@ def declaration_yes_control(page, heading_name):
     if heading is None:
         return None
 
-    yes_options = page.locator(
-        'input#PRESA_VISIONE_S[name="PRESA_VISIONE"][value="S"]'
-    )
+    yes_options = page.locator('input#PRESA_VISIONE_S[name="PRESA_VISIONE"][value="S"]')
     if yes_options.count() != 1:
         return None
 
@@ -464,9 +666,12 @@ def select_sol_english(page):
                     )
 
             last_step = "waiting for the SOL landing page"
-            if wait_for_sol_page_state(
+            if (
+                wait_for_sol_page_state(
                 page, timeout_seconds=30, accepted_states=("landing",)
-            ) != "landing":
+                )
+                != "landing"
+            ):
                 raise CheckerError("The SOL landing page was not ready.")
 
             # The AJAX content can appear just before its menu handler is ready.
@@ -503,9 +708,7 @@ def select_sol_english(page):
             english_option = only_visible(
                 open_menu.locator(
                     "a.dropdown-item, button.dropdown-item, [role=menuitem]"
-                ).filter(
-                    has_text=re.compile(r"^\s*English\s*$", re.IGNORECASE)
-                ),
+                ).filter(has_text=re.compile(r"^\s*English\s*$", re.IGNORECASE)),
                 "English language",
                 timeout_seconds=10,
             )
@@ -522,9 +725,12 @@ def select_sol_english(page):
                 "English SOL language indicator",
                 timeout_seconds=15,
             )
-            if wait_for_sol_page_state(
+            if (
+                wait_for_sol_page_state(
                 page, timeout_seconds=15, accepted_states=("landing",)
-            ) == "landing":
+                )
+                == "landing"
+            ):
                 return
             raise CheckerError("The SOL landing page did not settle in English.")
         except (CheckerError, PlaywrightError) as error:
@@ -589,10 +795,7 @@ def wait_for_signed_out_sol_state(page, timeout_seconds=30):
                 if state != candidate_state:
                     candidate_state = state
                     stable_since = time.monotonic()
-                elif (
-                    time.monotonic() - stable_since
-                    >= LOGOUT_STATE_STABLE_SECONDS
-                ):
+                elif time.monotonic() - stable_since >= LOGOUT_STATE_STABLE_SECONDS:
                     return state
             else:
                 candidate_state = None
@@ -664,9 +867,7 @@ def open_polimi_sso(page):
         except (CheckerError, PlaywrightError) as error:
             last_error = error
 
-        state = wait_for_sol_page_state(
-            page, accepted_states=("sso", "authenticated")
-        )
+        state = wait_for_sol_page_state(page, accepted_states=("sso", "authenticated"))
         if state in ("sso", "authenticated"):
             return state
 
@@ -711,12 +912,8 @@ def login(page, totp):
 
     with browser_stage("submitting Polimi credentials"):
         # These SSO inputs use placeholders but have no associated HTML labels.
-        first_visible(page.locator("input#login"), "person code").fill(
-            POLIMI_USERNAME
-        )
-        first_visible(page.locator("input#password"), "password").fill(
-            POLIMI_PASSWORD
-        )
+        first_visible(page.locator("input#login"), "person code").fill(POLIMI_USERNAME)
+        first_visible(page.locator("input#password"), "password").fill(POLIMI_PASSWORD)
         first_visible(
             page.get_by_role(
                 "button", name=re.compile(r"^(Sign in|Accedi)$", re.IGNORECASE)
@@ -734,7 +931,8 @@ def login(page, totp):
         otp_input.fill(fresh_totp(totp))
         first_visible(
             page.get_by_role(
-                "button", name=re.compile(r"^(Continue|Continua)$", re.IGNORECASE)
+                "button",
+                name=re.compile(r"^(Continue|Continua)$", re.IGNORECASE),
             ),
             "OTP continue",
         ).click()
@@ -845,9 +1043,7 @@ def wait_after_privacy_notice(
     ) from last_browser_error
 
 
-def wait_for_availability_table(
-    page, timeout_seconds=BOOKING_PAGE_TIMEOUT_SECONDS
-):
+def wait_for_availability_table(page, timeout_seconds=BOOKING_PAGE_TIMEOUT_SECONDS):
     deadline = time.monotonic() + timeout_seconds
     last_browser_error = None
     last_signature = None
@@ -890,9 +1086,7 @@ def open_availability_table(page):
         # English was selected on the landing page before LOGIN. Verify that the
         # authenticated portal preserved it before reading table headers.
         only_visible(
-            page.get_by_role(
-                "link", name=re.compile(r"^English$", re.IGNORECASE)
-            ),
+            page.get_by_role("link", name=re.compile(r"^English$", re.IGNORECASE)),
             "English portal language indicator",
         )
 
@@ -912,9 +1106,9 @@ def open_availability_table(page):
             f"{ACADEMIC_YEAR} full-rate accommodation section",
         )
         full_rate_section = full_rate_heading.locator(
-            'xpath=ancestor::div['
+            "xpath=ancestor::div["
             'contains(concat(" ", normalize-space(@class), " "), " row ")'
-            '][1]'
+            "][1]"
         )
         full_rate_section.wait_for(state="visible", timeout=30_000)
 
@@ -926,9 +1120,9 @@ def open_availability_table(page):
             "full-rate Accommodation Booking heading",
         )
         booking_card = booking_heading.locator(
-            'xpath=ancestor::div['
+            "xpath=ancestor::div["
             'contains(concat(" ", normalize-space(@class), " "), " small-box ")'
-            '][1]'
+            "][1]"
         )
         booking_card.wait_for(state="visible", timeout=30_000)
         booking_link = only_visible(
@@ -957,9 +1151,7 @@ def open_availability_table(page):
             )
             first_visible(save_buttons, "Save & Continue").click()
 
-        with browser_stage(
-            "waiting after the accommodation privacy notice"
-        ):
+        with browser_stage("waiting after the accommodation privacy notice"):
             state, control = wait_after_privacy_notice(page)
 
     if state == "residence_notice":
@@ -1222,14 +1414,7 @@ def alert_text(available, residence_totals, watched_residences):
             blocks.append(block)
     else:
         for residence, total in relevant_totals.items():
-            blocks.append(
-                [
-                    (
-                        f"🏢 {residence} — {total} "
-                        f"{count_label(total, 'room')}"
-                    )
-                ]
-            )
+            blocks.append([(f"🏢 {residence} — {total} {count_label(total, 'room')}")])
 
     for block in blocks:
         lines.extend(block)
@@ -1248,15 +1433,14 @@ def alert_text(available, residence_totals, watched_residences):
             ]
         )
         for residence, total in unmonitored_totals.items():
-            lines.append(
-                f"🏢 {residence} — {total} "
-                f"{count_label(total, 'room')}"
-            )
+            lines.append(f"🏢 {residence} — {total} {count_label(total, 'room')}")
 
     total_rooms = sum(relevant_totals.values())
     available_residences = len(relevant_totals)
-    total_label = "Monitored availability" if has_watched_availability else (
-        "Unmonitored availability"
+    total_label = (
+        "Monitored availability"
+        if has_watched_availability
+        else ("Unmonitored availability")
     )
     lines.extend(
         [
@@ -1287,9 +1471,7 @@ def alert_text(available, residence_totals, watched_residences):
             ]
         )
     else:
-        lines.append(
-            "ℹ️ No action is needed unless these residences interest you."
-        )
+        lines.append("ℹ️ No action is needed unless these residences interest you.")
     return "\n".join(lines)
 
 
@@ -1325,13 +1507,19 @@ def residence_menu_revision(catalog):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
 
 
-def main_menu_keyboard():
+def is_admin_chat(chat_id):
+    return chat_id in TELEGRAM_CHAT_IDS
+
+
+def main_menu_keyboard(chat_id):
+    first_row = []
+    if is_admin_chat(chat_id):
+        first_row.append({"text": BUTTON_CHECK_NOW})
+    first_row.append({"text": BUTTON_MANAGE_RESIDENCES})
     return {
         "keyboard": [
-            [
-                {"text": BUTTON_CHECK_NOW},
-                {"text": BUTTON_MANAGE_RESIDENCES},
-            ],
+            first_row,
+            [{"text": BUTTON_NOTIFICATION_SETTINGS}],
             [{"text": BUTTON_HELP}],
         ],
         "resize_keyboard": True,
@@ -1339,7 +1527,7 @@ def main_menu_keyboard():
     }
 
 
-def residence_menu_keyboard(catalog, watched):
+def residence_menu_keyboard(catalog, watched, allow_refresh):
     watched = set(watched)
     revision = residence_menu_revision(catalog)
     buttons = []
@@ -1351,14 +1539,11 @@ def residence_menu_keyboard(catalog, watched):
             [
                 {
                     "text": f"{marker} · {residence}",
-                    "callback_data": (
-                        f"rh|{revision}|{index}|{desired_state}"
-                    ),
+                    "callback_data": (f"rh|{revision}|{index}|{desired_state}"),
                 }
             ]
         )
-    buttons.extend(
-        [
+    buttons.append(
             [
                 {
                     "text": "✅ Monitor all",
@@ -1368,13 +1553,15 @@ def residence_menu_keyboard(catalog, watched):
                     "text": "📊 Totals only",
                     "callback_data": f"rh|{revision}|all|0",
                 },
-            ],
+        ]
+    )
+    if allow_refresh:
+        buttons.append(
             [
                 {
                     "text": "🔄 Refresh list from SOL",
                     "callback_data": f"rh|{revision}|refresh",
                 }
-            ],
         ]
     )
     return {"inline_keyboard": buttons}
@@ -1394,9 +1581,7 @@ def residence_list_text(catalog, watched, notice=""):
             "Tap a residence to change how its availability is reported.",
             "✅ Monitored: show room-type details and send the urgent alert",
             "▫️ Total only: show one combined total in the optional alert",
-            (
-                f"⭐ Monitored: {len(watched)} of {len(catalog)} residences"
-            ),
+            (f"⭐ Monitored: {len(watched)} of {len(catalog)} residences"),
             "",
             NOTIFICATION_DIVIDER,
             "",
@@ -1415,25 +1600,124 @@ def residence_list_text(catalog, watched, notice=""):
     return "\n".join(lines)
 
 
-def telegram_help_text():
-    return "\n".join(
+def interval_hours_text(multiplier):
+    try:
+        hours = float(CHECK_INTERVAL_HOURS) * multiplier
+    except ValueError:
+        return f"{multiplier}× the system interval"
+    return f"{hours:g} hours"
+
+
+def notification_settings_keyboard(enabled, multiplier):
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": (
+                        "🔕 Turn notifications off"
+                        if enabled
+                        else "🔔 Turn notifications on"
+                    ),
+                    "callback_data": f"nt|{int(not enabled)}",
+                }
+            ],
+            [
+                {
+                    "text": "➖",
+                    "callback_data": f"iv|{max(1, multiplier - 1)}",
+                },
+                {
+                    "text": f"{multiplier}× · {interval_hours_text(multiplier)}",
+                    "callback_data": "iv|show",
+                },
+                {
+                    "text": "➕",
+                    "callback_data": f"iv|{multiplier + 1}",
+                },
+            ],
+            [
+                {
+                    "text": "Reset to every check (1×)",
+                    "callback_data": "iv|1",
+                }
+            ],
+        ]
+    }
+
+
+def notification_settings_text(chat_id, notice=""):
+    enabled, multiplier = user_notification_settings(chat_id)
+    lines = [
+        "⚙️ NOTIFICATION SETTINGS",
+        "🏠 Polimi Residence Checker",
+        "",
+    ]
+    if notice:
+        lines.extend([notice, ""])
+    lines.extend(
         [
+            f"Notifications: {'🔔 On' if enabled else '🔕 Off'}",
+            (
+                f"Interval: every {multiplier} system "
+                f"{count_label(multiplier, 'check')} ({interval_hours_text(multiplier)})"
+            ),
+            "",
+            (
+                "The website is still checked only on the global schedule. "
+                "Your interval changes only which completed checks are sent to you."
+            ),
+        ]
+    )
+    if is_admin_chat(chat_id):
+        lines.extend(
+            [
+                "",
+                "🔐 Administrator alerts are sent immediately when they are due.",
+            ]
+        )
+    elif not subscriber_notifications_enabled():
+        lines.extend(
+            [
+                "",
+                "⏸ Subscriber notifications are currently disabled by the administrator.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def telegram_help_text(chat_id):
+    lines = [
             "🤖 POLIMI RESIDENCE CHECKER",
             "",
             "Here is what each button does:",
             "",
+    ]
+    if is_admin_chat(chat_id):
+        lines.extend(
+            [
             f"{BUTTON_CHECK_NOW}",
             "Run a fresh SOL check and receive the result.",
             "",
+            ]
+        )
+    lines.extend(
+        [
             f"{BUTTON_MANAGE_RESIDENCES}",
             "See every residence and choose which ones are monitored.",
+            "",
+            f"{BUTTON_NOTIFICATION_SETTINGS}",
+            "Turn scheduled alerts on or off and choose an interval multiple.",
             "",
             f"{BUTTON_HELP}",
             "Show this explanation again.",
             "",
-            "🔒 Only the configured private Telegram chat can use these controls.",
+            (
+                "🔐 Check now and SOL list refresh are available only to "
+                "configured administrators."
+            ),
         ]
     )
+    return "\n".join(lines)
 
 
 def telegram_api_call(method, parameters, timeout_seconds=20):
@@ -1456,11 +1740,11 @@ def telegram_api_call(method, parameters, timeout_seconds=20):
     return payload.get("result")
 
 
-def send_telegram(message, reply_markup=None):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+def send_telegram(chat_id, message, reply_markup=None):
+    if not (TELEGRAM_BOT_TOKEN and chat_id):
         return False
 
-    parameters = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    parameters = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         parameters["reply_markup"] = reply_markup
 
@@ -1556,6 +1840,23 @@ def get_telegram_updates(offset):
     return result
 
 
+def parse_settings_callback(data):
+    toggle_match = re.fullmatch(r"nt\|([01])", data)
+    if toggle_match:
+        return {
+            "action": "notifications",
+            "enabled": toggle_match.group(1) == "1",
+        }
+    interval_match = re.fullmatch(r"iv\|(show|[1-9][0-9]*)", data)
+    if interval_match:
+        value = interval_match.group(1)
+        return {
+            "action": "interval",
+            "multiplier": None if value == "show" else int(value),
+        }
+    return None
+
+
 def authorized_telegram_action(update):
     callback = update.get("callback_query")
     if isinstance(callback, dict):
@@ -1567,19 +1868,23 @@ def authorized_telegram_action(update):
             not isinstance(callback_id, str)
             or not callback_id
             or not isinstance(source, dict)
-            or str(source.get("id")) != TELEGRAM_CHAT_ID
             or not isinstance(message, dict)
             or "inline_message_id" in callback
             or not isinstance(data, str)
             or not 1 <= len(data.encode("utf-8")) <= 64
-            or parse_residence_callback(data) is None
+            or (
+                parse_residence_callback(data) is None
+                and parse_settings_callback(data) is None
+            )
         ):
             return None
         chat = message.get("chat")
         message_id = message.get("message_id")
+        chat_id = str(chat.get("id")) if isinstance(chat, dict) else ""
         if (
             not isinstance(chat, dict)
-            or str(chat.get("id")) != TELEGRAM_CHAT_ID
+            or re.fullmatch(r"[0-9]+", chat_id) is None
+            or chat_id != str(source.get("id"))
             or chat.get("type") != "private"
             or not isinstance(message_id, int)
         ):
@@ -1587,9 +1892,11 @@ def authorized_telegram_action(update):
         return {
             "kind": "callback",
             "callback_id": callback_id,
-            "chat_id": str(chat["id"]),
+            "chat_id": chat_id,
             "message_id": message_id,
             "data": data,
+            "is_admin": is_admin_chat(chat_id),
+            "source": source,
         }
 
     message = update.get("message")
@@ -1597,25 +1904,35 @@ def authorized_telegram_action(update):
         return None
     chat = message.get("chat")
     source = message.get("from")
+    chat_id = str(chat.get("id")) if isinstance(chat, dict) else ""
     if (
         not isinstance(chat, dict)
-        or str(chat.get("id")) != TELEGRAM_CHAT_ID
+        or re.fullmatch(r"[0-9]+", chat_id) is None
         or chat.get("type") != "private"
         or not isinstance(source, dict)
-        or str(source.get("id")) != TELEGRAM_CHAT_ID
+        or chat_id != str(source.get("id"))
     ):
         return None
 
     text = message.get("text")
-    if text == BUTTON_CHECK_NOW:
+    is_admin = is_admin_chat(chat_id)
+    if text == BUTTON_CHECK_NOW and is_admin:
         action = "check"
     elif text == BUTTON_MANAGE_RESIDENCES:
         action = "residences"
+    elif text == BUTTON_NOTIFICATION_SETTINGS:
+        action = "settings"
+    elif isinstance(text, str) and text.partition(" ")[0] == "/start":
+        action = "start"
     else:
-        # This also handles Telegram's built-in Start button without requiring
-        # the user to type or remember special text.
         action = "help"
-    return {"kind": "message", "action": action}
+    return {
+        "kind": "message",
+        "action": action,
+        "chat_id": chat_id,
+        "is_admin": is_admin,
+        "source": source,
+    }
 
 
 def callback_id_from_update(update):
@@ -1641,9 +1958,7 @@ def telegram_action_listener():
             if durable_offset > offset:
                 offset = durable_offset
                 queued_update_ids = {
-                    update_id
-                    for update_id in queued_update_ids
-                    if update_id >= offset
+                    update_id for update_id in queued_update_ids if update_id >= offset
                 }
 
             updates = get_telegram_updates(offset)
@@ -1658,6 +1973,9 @@ def telegram_action_listener():
                     continue
 
                 action = authorized_telegram_action(update)
+                if action is not None:
+                    source = action.pop("source")
+                    register_telegram_user(action["chat_id"], source)
                 callback_id = callback_id_from_update(update)
                 action_key = sol_check_action_key(action)
                 if action_key is not None:
@@ -1676,6 +1994,7 @@ def telegram_action_listener():
                             )
                         else:
                             send_notification(
+                                action["chat_id"],
                                 "\n".join(
                                     [
                                         "⏳ REQUEST ALREADY IN PROGRESS",
@@ -1688,9 +2007,7 @@ def telegram_action_listener():
                         action = None
                 elif callback_id:
                     callback_text = (
-                        "Updating…"
-                        if action is not None
-                        else "Not authorized."
+                        "Updating…" if action is not None else "Not authorized."
                     )
                     answer_callback_query(callback_id, callback_text)
 
@@ -1703,7 +2020,13 @@ def telegram_action_listener():
             # still discovering and acknowledging new callbacks promptly.
             if updates and not queued_new_update:
                 time.sleep(TELEGRAM_DUPLICATE_POLL_SECONDS)
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             log(
                 "Telegram button polling failed; retrying in "
                 f"{TELEGRAM_POLL_RETRY_SECONDS} seconds."
@@ -1728,7 +2051,7 @@ def start_telegram_action_listener():
 
 
 def telegram_configured():
-    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS)
 
 
 def telegram_message_chunks(message):
@@ -1744,27 +2067,28 @@ def telegram_message_chunks(message):
     return chunks
 
 
-def send_notification(message, description, reply_markup=None):
+def send_notification(chat_id, message, description, reply_markup=None):
     if not telegram_configured():
         log(f"Telegram is not configured; {description} was not sent.")
         return False
     if reply_markup is None:
-        reply_markup = main_menu_keyboard()
+        reply_markup = main_menu_keyboard(chat_id)
     chunks = telegram_message_chunks(message)
     for index, chunk in enumerate(chunks, start=1):
         chunk_markup = reply_markup if index == len(chunks) else None
-        if not send_telegram(chunk, chunk_markup):
+        if not send_telegram(chat_id, chunk, chunk_markup):
             log(
-                f"Telegram {description} failed on part {index}/{len(chunks)}; "
+                f"Telegram {description} to chat {chat_id} failed on part "
+                f"{index}/{len(chunks)}; "
                 "check its settings and the network."
             )
             return False
     suffix = f" in {len(chunks)} parts" if len(chunks) > 1 else ""
-    log(f"Telegram {description} sent{suffix}.")
+    log(f"Telegram {description} sent to chat {chat_id}{suffix}.")
     return True
 
 
-def send_error_notification(description):
+def send_error_notification(description, chat_ids=None):
     message = "\n".join(
         [
             "⚠️ CHECK FAILED",
@@ -1782,7 +2106,9 @@ def send_error_notification(description):
             "🛡️ No room was booked.",
         ]
     )
-    send_notification(message, "error alert")
+    recipients = TELEGRAM_CHAT_IDS if chat_ids is None else chat_ids
+    for chat_id in recipients:
+        send_notification(chat_id, message, "error alert")
 
 
 def check_once(totp):
@@ -1806,21 +2132,17 @@ def check_once(totp):
                 available, checked_cells, residence_totals = read_availability(table)
 
             try:
-                watched_residences = refresh_residence_catalog(
-                    residence_totals.keys()
-                )
+                refresh_residence_catalog(residence_totals.keys())
             except OSError:
                 log(
-                    "Residence preferences could not be saved; "
-                    "treating all residences as watched for this check."
+                    "The residence catalog could not be saved; "
+                    "the current result will still be delivered."
                 )
-                watched_residences = set(residence_totals)
 
             result = {
                 "available": available,
                 "checked_cells": checked_cells,
                 "residence_totals": residence_totals,
-                "watched_residences": watched_residences,
             }
 
             try:
@@ -1848,9 +2170,19 @@ def configuration(use_start_hour=True):
     if missing:
         raise CheckerError(f"Missing .env values: {', '.join(missing)}")
 
-    if bool(TELEGRAM_BOT_TOKEN) != bool(TELEGRAM_CHAT_ID):
+    if bool(TELEGRAM_BOT_TOKEN) != bool(TELEGRAM_CHAT_IDS):
         raise CheckerError(
-            "Set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or leave both empty."
+            "Set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS, or leave both empty."
+        )
+    invalid_chat_ids = [
+        chat_id
+        for chat_id in TELEGRAM_CHAT_IDS
+        if re.fullmatch(r"[0-9]+", chat_id) is None
+    ]
+    if invalid_chat_ids:
+        raise CheckerError(
+            "TELEGRAM_CHAT_IDS must contain numeric private-chat IDs "
+            "separated by commas."
         )
 
     academic_year_start(ACADEMIC_YEAR)
@@ -1859,6 +2191,9 @@ def configuration(use_start_hour=True):
         "INCLUDE_RESIDENCE_NOTICE_PAGE",
         INCLUDE_RESIDENCE_NOTICE_PAGE_VALUE,
     )
+    delayed_notifications_enabled()
+    subscriber_notifications_enabled()
+    notification_delay_minutes()
 
     try:
         interval_hours = float(CHECK_INTERVAL_HOURS)
@@ -1926,7 +2261,104 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def run_check_safely(totp, always_report=False):
+def send_check_result(chat_id, result, always_report=False, description="check result"):
+    available = result["available"]
+    if available:
+        _, watched = residence_preferences(chat_id)
+        message = alert_text(
+            available,
+            result["residence_totals"],
+            watched,
+        )
+        return send_notification(chat_id, message, description)
+    if always_report:
+        message = no_availability_text(
+            result["checked_cells"],
+            result["residence_totals"],
+        )
+        return send_notification(chat_id, message, description)
+    return True
+
+
+def deliver_delayed_subscriber_results(chat_ids, result, delay_seconds):
+    if not subscriber_notifications_enabled():
+        return
+    if delay_seconds > 0:
+        log(
+            f"Waiting {delay_seconds / 60:g} minutes before sending "
+            f"to {len(chat_ids)} subscriber(s)."
+        )
+        time.sleep(delay_seconds)
+    if not subscriber_notifications_enabled():
+        return
+    for chat_id in chat_ids:
+        if user_notifications_enabled(chat_id):
+            send_check_result(
+                chat_id,
+                result,
+                description="delayed availability alert",
+            )
+
+
+def dispatch_scheduled_result(result, already_notified_admins=()):
+    try:
+        due_admins, due_subscribers = advance_scheduled_recipients()
+    except OSError:
+        log(
+            "Recipient schedules could not be saved; sending this result "
+            "to all enabled administrators only."
+        )
+        due_admins = [
+            chat_id
+            for chat_id in TELEGRAM_CHAT_IDS
+            if user_notifications_enabled(chat_id)
+        ]
+        due_subscribers = []
+
+    if not result["available"]:
+        log(f"No availability found ({result['checked_cells']} cells checked).")
+        return
+
+    log(
+        f"Availability found; {len(due_admins)} administrator(s) and "
+        f"{len(due_subscribers)} subscriber(s) are due this check."
+    )
+    already_notified_admins = set(already_notified_admins)
+    for chat_id in due_admins:
+        if chat_id in already_notified_admins:
+            continue
+        send_check_result(chat_id, result, description="availability alert")
+
+    if not due_subscribers:
+        return
+    if not subscriber_notifications_enabled():
+        log(
+            f"Suppressed scheduled delivery to {len(due_subscribers)} "
+            "subscriber(s) because subscriber notifications are disabled."
+        )
+        return
+    delay_seconds = 0
+    if delayed_notifications_enabled():
+        delay_seconds = notification_delay_minutes() * 60
+    if delay_seconds <= 0:
+        deliver_delayed_subscriber_results(due_subscribers, result, 0)
+        return
+    delivery_thread = threading.Thread(
+        target=deliver_delayed_subscriber_results,
+        args=(due_subscribers, result, delay_seconds),
+        name="telegram-delayed-notification",
+        daemon=True,
+    )
+    delivery_thread.start()
+
+
+def run_check_safely(
+    totp,
+    always_report=False,
+    scheduled=False,
+    recipient_chat_ids=None,
+    result_sink=None,
+):
     try:
         result, logout_error = check_once(totp)
     except PlaywrightTimeoutError:
@@ -1938,41 +2370,55 @@ def run_check_safely(totp, always_report=False):
     except Exception as error:
         description = f"Unexpected failure ({type(error).__name__})."
     else:
-        available = result["available"]
-        checked_cells = result["checked_cells"]
-        residence_totals = result["residence_totals"]
-
+        if result_sink is not None:
+            result_sink["check_result"] = result
         # Report the table result before a possible logout warning so cleanup
         # failure can never hide real availability.
-        if available:
-            message = alert_text(
-                available,
-                residence_totals,
-                result["watched_residences"],
-            )
-            log(message)
-            send_notification(message, "availability alert")
-        elif always_report:
-            message = no_availability_text(checked_cells, residence_totals)
-            log(message)
-            send_notification(message, "on-demand check result")
+        if scheduled:
+            dispatch_scheduled_result(result)
         else:
-            log(f"No availability found ({checked_cells} cells checked).")
+            recipients = (
+                TELEGRAM_CHAT_IDS if recipient_chat_ids is None else recipient_chat_ids
+            )
+            if result["available"] or always_report:
+                for chat_id in recipients:
+                    send_check_result(
+                        chat_id,
+                        result,
+                        always_report=always_report,
+                        description=(
+                            "on-demand check result"
+                            if always_report
+                            else "availability alert"
+                        ),
+                    )
+            else:
+                log(f"No availability found ({result['checked_cells']} cells checked).")
 
         if logout_error is None:
             return True
         description = str(logout_error)
 
     log(f"Check failed: {description}")
-    send_error_notification(description)
+    error_recipients = (
+        TELEGRAM_CHAT_IDS
+        if scheduled or recipient_chat_ids is None
+        else recipient_chat_ids
+    )
+    send_error_notification(description, error_recipients)
     return False
 
 
-def send_residence_manager(catalog, watched, notice=""):
+def send_residence_manager(chat_id, catalog, watched, notice=""):
     return send_notification(
+        chat_id,
         residence_list_text(catalog, watched, notice),
         "residence controls",
-        reply_markup=residence_menu_keyboard(catalog, watched),
+        reply_markup=residence_menu_keyboard(
+            catalog,
+            watched,
+            allow_refresh=is_admin_chat(chat_id),
+        ),
     )
 
 
@@ -1984,7 +2430,11 @@ def edit_or_send_residence_manager(
     notice="",
 ):
     message = residence_list_text(catalog, watched, notice)
-    keyboard = residence_menu_keyboard(catalog, watched)
+    keyboard = residence_menu_keyboard(
+        catalog,
+        watched,
+        allow_refresh=is_admin_chat(chat_id),
+    )
     if edit_telegram_message(
         chat_id,
         message_id,
@@ -1993,6 +2443,7 @@ def edit_or_send_residence_manager(
     ):
         return True
     return send_residence_manager(
+        chat_id,
         catalog,
         watched,
         "♻️ The previous panel could not be updated. Use this new panel.",
@@ -2024,12 +2475,28 @@ def parse_residence_callback(data):
     }
 
 
-def load_residence_catalog_for_action(totp):
-    catalog, watched = residence_preferences()
+def load_residence_catalog_for_action(chat_id, is_admin, totp, result_sink):
+    catalog, watched = residence_preferences(chat_id)
     if catalog:
         return catalog, watched, False
 
+    if not is_admin:
+        send_notification(
+            chat_id,
+            "\n".join(
+                [
+                    "⏳ RESIDENCE LIST NOT READY",
+                    "🏠 Polimi Residence Checker",
+                    "",
+                    "The residence list will become available after the next scheduled check.",
+                ]
+            ),
+            "residence-list status",
+        )
+        return catalog, watched, False
+
     send_notification(
+        chat_id,
         "\n".join(
             [
                 "🔄 LOADING RESIDENCE LIST",
@@ -2041,10 +2508,15 @@ def load_residence_catalog_for_action(totp):
         ),
         "residence discovery status",
     )
-    run_check_safely(totp)
-    catalog, watched = residence_preferences()
+    run_check_safely(
+        totp,
+        recipient_chat_ids=(chat_id,),
+        result_sink=result_sink,
+    )
+    catalog, watched = residence_preferences(chat_id)
     if not catalog:
         send_notification(
+            chat_id,
             "\n".join(
                 [
                     "⚠️ RESIDENCE LIST UNAVAILABLE",
@@ -2059,17 +2531,22 @@ def load_residence_catalog_for_action(totp):
     return catalog, watched, True
 
 
-def save_current_telegram_ui_version():
+def save_current_telegram_ui_version(chat_id):
     try:
-        save_telegram_ui_version(TELEGRAM_UI_VERSION)
+        save_telegram_ui_version(chat_id, TELEGRAM_UI_VERSION)
     except OSError:
         log("Telegram control version could not be saved.")
 
 
 def ensure_telegram_controls():
-    if telegram_ui_version() >= TELEGRAM_UI_VERSION:
-        return
+    ensure_admin_users()
+    with BOT_STATE_LOCK:
+        chat_ids = list(read_bot_state_unlocked()["users"])
+    for chat_id in chat_ids:
+        if telegram_ui_version(chat_id) >= TELEGRAM_UI_VERSION:
+            continue
     if send_notification(
+            chat_id,
         "\n".join(
             [
                 "🤖 POLIMI RESIDENCE CHECKER",
@@ -2080,24 +2557,61 @@ def ensure_telegram_controls():
         ),
         "button setup",
     ):
-        save_current_telegram_ui_version()
+            save_current_telegram_ui_version(chat_id)
+
+
+def send_notification_settings(chat_id, notice=""):
+    enabled, multiplier = user_notification_settings(chat_id)
+    return send_notification(
+        chat_id,
+        notification_settings_text(chat_id, notice),
+        "notification settings",
+        reply_markup=notification_settings_keyboard(enabled, multiplier),
+    )
+
+
+def edit_or_send_notification_settings(chat_id, message_id, notice=""):
+    enabled, multiplier = user_notification_settings(chat_id)
+    message = notification_settings_text(chat_id, notice)
+    keyboard = notification_settings_keyboard(enabled, multiplier)
+    if edit_telegram_message(chat_id, message_id, message, keyboard):
+        return True
+    return send_notification_settings(
+        chat_id,
+        "♻️ The previous panel could not be updated. Use this new panel.",
+    )
 
 
 def handle_telegram_action(action, totp):
+    chat_id = action["chat_id"]
     if action["kind"] == "message":
         message_action = action["action"]
-        if message_action == "help":
-            if send_notification(telegram_help_text(), "help response"):
-                save_current_telegram_ui_version()
+        if message_action in ("start", "help"):
+            if send_notification(
+                chat_id,
+                telegram_help_text(chat_id),
+                "welcome response" if message_action == "start" else "help response",
+            ):
+                save_current_telegram_ui_version(chat_id)
+            return False
+
+        if message_action == "settings":
+            send_notification_settings(chat_id)
             return False
 
         if message_action == "residences":
-            catalog, watched, ran_check = load_residence_catalog_for_action(totp)
+            catalog, watched, ran_check = load_residence_catalog_for_action(
+                chat_id,
+                action["is_admin"],
+                totp,
+                action,
+            )
             if catalog:
-                send_residence_manager(catalog, watched)
+                send_residence_manager(chat_id, catalog, watched)
             return ran_check
 
         send_notification(
+            chat_id,
             "\n".join(
                 [
                     "🔎 CHECK STARTED",
@@ -2109,10 +2623,55 @@ def handle_telegram_action(action, totp):
             ),
             "on-demand check status",
         )
-        run_check_safely(totp, always_report=True)
+        run_check_safely(
+            totp,
+            always_report=True,
+            recipient_chat_ids=(chat_id,),
+            result_sink=action,
+        )
         return True
 
-    catalog, watched, ran_check = load_residence_catalog_for_action(totp)
+    settings_callback = parse_settings_callback(action["data"])
+    if settings_callback is not None:
+        try:
+            if settings_callback["action"] == "notifications":
+                enabled = settings_callback["enabled"]
+                set_user_notifications_enabled(chat_id, enabled)
+                notice = (
+                    "✅ Scheduled notifications turned on."
+                    if enabled
+                    else "✅ Scheduled notifications turned off."
+                )
+            else:
+                multiplier = settings_callback["multiplier"]
+                if multiplier is None:
+                    notice = "ℹ️ Use minus or plus to change the interval."
+                else:
+                    set_user_interval_multiplier(chat_id, multiplier)
+                    notice = (
+                        f"✅ Interval set to every {multiplier} system "
+                        f"{count_label(multiplier, 'check')}."
+                    )
+        except OSError:
+            send_notification(
+                chat_id,
+                "⚠️ Notification settings could not be saved. Please try again.",
+                "notification-settings save failure",
+            )
+            return False
+        edit_or_send_notification_settings(
+            chat_id,
+            action["message_id"],
+            notice,
+        )
+        return False
+
+    catalog, watched, ran_check = load_residence_catalog_for_action(
+        chat_id,
+        action["is_admin"],
+        totp,
+        action,
+    )
     if not catalog:
         return ran_check
 
@@ -2130,8 +2689,21 @@ def handle_telegram_action(action, totp):
 
     target = callback["target"]
     if target == "refresh":
-        refresh_succeeded = run_check_safely(totp)
-        catalog, watched = residence_preferences()
+        if not action["is_admin"]:
+            edit_or_send_residence_manager(
+                chat_id,
+                action["message_id"],
+                catalog,
+                watched,
+                "🔐 Only administrators can refresh the list from SOL.",
+            )
+            return ran_check
+        refresh_succeeded = run_check_safely(
+            totp,
+            recipient_chat_ids=(chat_id,),
+            result_sink=action,
+        )
+        catalog, watched = residence_preferences(chat_id)
         if catalog:
             notice = (
                 "✅ Residence list refreshed from SOL."
@@ -2160,15 +2732,17 @@ def handle_telegram_action(action, totp):
     try:
         if target == "all":
             catalog, watched = update_all_residence_watches(
-                should_watch=callback["should_watch"]
+                chat_id, should_watch=callback["should_watch"]
             )
         else:
             catalog, watched = update_residence_watch(
+                chat_id,
                 [target + 1],
                 should_watch=callback["should_watch"],
             )
     except OSError:
         send_notification(
+            chat_id,
             "\n".join(
                 [
                     "⚠️ PREFERENCES NOT SAVED",
@@ -2211,11 +2785,9 @@ def next_interval_start(
     )
     previous_target = anchor + elapsed_intervals * interval
 
-    if (
-        include_current_minute
-        and previous_target.replace(second=0, microsecond=0)
-        == now.replace(second=0, microsecond=0)
-    ):
+    if include_current_minute and previous_target.replace(
+        second=0, microsecond=0
+    ) == now.replace(second=0, microsecond=0):
         return now
 
     return previous_target + interval
@@ -2233,9 +2805,7 @@ def next_interval_deadline(scheduled_deadline, interval_seconds, now=None):
     now = time.monotonic() if now is None else now
     next_deadline = scheduled_deadline + interval_seconds
     if next_deadline <= now:
-        missed_intervals = math.floor(
-            (now - next_deadline) / interval_seconds
-        ) + 1
+        missed_intervals = math.floor((now - next_deadline) / interval_seconds) + 1
         next_deadline += missed_intervals * interval_seconds
     return next_deadline
 
@@ -2249,19 +2819,12 @@ def monotonic_deadline_for_wall_target(target, wall_now=None, monotonic_now=None
 def log_next_interval_check(deadline):
     wait_seconds = max(0, deadline - time.monotonic())
     target = datetime.now(TEHRAN_TIMEZONE) + timedelta(seconds=wait_seconds)
-    log(
-        "Next interval check at "
-        f"{target.isoformat(timespec='minutes')} (Asia/Tehran)."
-    )
+    log(f"Next interval check at {target.isoformat(timespec='minutes')} (Asia/Tehran).")
 
 
 def next_tehran_slot(include_current_minute=False, now=None):
     now = now or datetime.now(TEHRAN_TIMEZONE)
-    if (
-        include_current_minute
-        and now.hour in TEHRAN_CHECK_HOURS
-        and now.minute == 0
-    ):
+    if include_current_minute and now.hour in TEHRAN_CHECK_HOURS and now.minute == 0:
         return now
 
     for hour in TEHRAN_CHECK_HOURS:
@@ -2276,10 +2839,7 @@ def next_tehran_slot(include_current_minute=False, now=None):
 
 
 def log_next_tehran_check(target):
-    log(
-        "Next check at "
-        f"{target.isoformat(timespec='minutes')} (Asia/Tehran)."
-    )
+    log(f"Next check at {target.isoformat(timespec='minutes')} (Asia/Tehran).")
 
 
 def run_service(arguments, totp, interval_hours, start_hour):
@@ -2316,8 +2876,7 @@ def run_service(arguments, totp, interval_hours, start_hour):
                     wait_seconds = max(
                         0,
                         (
-                            interval_start_target
-                            - datetime.now(TEHRAN_TIMEZONE)
+                            interval_start_target - datetime.now(TEHRAN_TIMEZONE)
                         ).total_seconds(),
                     )
                 else:
@@ -2328,9 +2887,7 @@ def run_service(arguments, totp, interval_hours, start_hour):
             else:
                 wait_seconds = max(
                     0,
-                    (
-                        tehran_target - datetime.now(TEHRAN_TIMEZONE)
-                    ).total_seconds(),
+                    (tehran_target - datetime.now(TEHRAN_TIMEZONE)).total_seconds(),
                 )
 
             if wait_seconds <= 0:
@@ -2338,11 +2895,9 @@ def run_service(arguments, totp, interval_hours, start_hour):
                     scheduled_deadline = (
                         interval_deadline
                         if interval_deadline is not None
-                        else monotonic_deadline_for_wall_target(
-                            interval_start_target
-                        )
+                        else monotonic_deadline_for_wall_target(interval_start_target)
                     )
-                run_check_safely(totp)
+                run_check_safely(totp, scheduled=True)
                 if arguments.mode == "interval":
                     interval_deadline = next_interval_deadline(
                         scheduled_deadline,
@@ -2355,28 +2910,19 @@ def run_service(arguments, totp, interval_hours, start_hour):
                     log_next_tehran_check(tehran_target)
                 continue
 
-            waiting_on_wall_clock = (
-                arguments.mode == "tehran"
-                or (
-                    arguments.mode == "interval"
-                    and interval_deadline is None
-                )
+            waiting_on_wall_clock = arguments.mode == "tehran" or (
+                arguments.mode == "interval" and interval_deadline is None
             )
             queue_timeout = (
-                min(wait_seconds, 60)
-                if waiting_on_wall_clock
-                else wait_seconds
+                min(wait_seconds, 60) if waiting_on_wall_clock else wait_seconds
             )
             try:
-                update_id, action = TELEGRAM_ACTION_QUEUE.get(
-                    timeout=queue_timeout
-                )
+                update_id, action = TELEGRAM_ACTION_QUEUE.get(timeout=queue_timeout)
             except Empty:
                 if (
                     arguments.mode == "interval"
                     and interval_deadline is None
-                    and datetime.now(TEHRAN_TIMEZONE)
-                    < interval_start_target
+                    and datetime.now(TEHRAN_TIMEZONE) < interval_start_target
                 ):
                     continue
                 if (
@@ -2388,11 +2934,9 @@ def run_service(arguments, totp, interval_hours, start_hour):
                     scheduled_deadline = (
                         interval_deadline
                         if interval_deadline is not None
-                        else monotonic_deadline_for_wall_target(
-                            interval_start_target
+                        else monotonic_deadline_for_wall_target(interval_start_target)
                         )
-                    )
-                run_check_safely(totp)
+                run_check_safely(totp, scheduled=True)
                 if arguments.mode == "interval":
                     interval_deadline = next_interval_deadline(
                         scheduled_deadline,
@@ -2433,20 +2977,29 @@ def run_service(arguments, totp, interval_hours, start_hour):
             if not completed_check:
                 continue
 
-            # A manual/discovery check attempt that crosses a scheduled
-            # deadline satisfies that slot, matching the normal behavior where
-            # even a failed scheduled attempt waits until the next slot.
+            # Reuse a successful on-demand result when it crosses a scheduled
+            # deadline. This satisfies the slot without opening SOL twice.
             if arguments.mode == "interval":
                 crossed_start_target = (
                     interval_deadline is None
-                    and datetime.now(TEHRAN_TIMEZONE)
-                    >= interval_start_target
+                    and datetime.now(TEHRAN_TIMEZONE) >= interval_start_target
                 )
                 crossed_interval_deadline = (
                     interval_deadline is not None
                     and time.monotonic() >= interval_deadline
                 )
                 if crossed_start_target or crossed_interval_deadline:
+                    check_result = action.get("check_result")
+                    if check_result is None:
+                        log(
+                            "The on-demand check failed across a scheduled "
+                            "deadline; the scheduled check will still run."
+                        )
+                        continue
+                    dispatch_scheduled_result(
+                        check_result,
+                        already_notified_admins=(action["chat_id"],),
+                    )
                     scheduled_deadline = (
                         interval_deadline
                         if interval_deadline is not None
@@ -2461,14 +3014,23 @@ def run_service(arguments, totp, interval_hours, start_hour):
                         interval_seconds,
                     )
                     interval_start_target = None
-                    log(
-                        "The on-demand check satisfied the scheduled run."
-                    )
+                    log("The on-demand check satisfied the scheduled run.")
                     log_next_interval_check(interval_deadline)
             elif (
                 arguments.mode == "tehran"
                 and datetime.now(TEHRAN_TIMEZONE) >= tehran_target
             ):
+                check_result = action.get("check_result")
+                if check_result is None:
+                    log(
+                        "The on-demand check failed across the scheduled "
+                        "Tehran slot; the scheduled check will still run."
+                    )
+                    continue
+                dispatch_scheduled_result(
+                    check_result,
+                    already_notified_admins=(action["chat_id"],),
+                )
                 tehran_target = next_tehran_slot()
                 log("The on-demand check satisfied the scheduled Tehran slot.")
                 log_next_tehran_check(tehran_target)
@@ -2479,7 +3041,10 @@ def run_service(arguments, totp, interval_hours, start_hour):
 
 def test_telegram():
     if not telegram_configured():
-        log("Telegram test failed: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+        log("Telegram test failed: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS.")
+        return 1
+    if any(re.fullmatch(r"[0-9]+", chat_id) is None for chat_id in TELEGRAM_CHAT_IDS):
+        log("Telegram test failed: TELEGRAM_CHAT_IDS must be numeric.")
         return 1
 
     message = "\n".join(
@@ -2496,9 +3061,15 @@ def test_telegram():
             "🌐 SOL was not opened for this test.",
         ]
     )
-    if send_telegram(message, main_menu_keyboard()):
-        save_current_telegram_ui_version()
-        log("Telegram test message sent.")
+    ensure_admin_users()
+    sent = True
+    for chat_id in TELEGRAM_CHAT_IDS:
+        if send_telegram(chat_id, message, main_menu_keyboard(chat_id)):
+            save_current_telegram_ui_version(chat_id)
+        else:
+            sent = False
+    if sent:
+        log(f"Telegram test message sent to {len(TELEGRAM_CHAT_IDS)} administrator(s).")
         return 0
     log("Telegram test failed; check its settings and the network.")
     return 1
@@ -2512,16 +3083,16 @@ def main():
 
     try:
         totp, interval_hours, start_hour = configuration(
-            use_start_hour=(
-                arguments.mode == "interval"
-                and not arguments.once
-            )
+            use_start_hour=(arguments.mode == "interval" and not arguments.once)
         )
     except CheckerError as error:
         description = f"Configuration error: {error}"
         log(description)
         send_error_notification(description)
         return 2
+
+    if telegram_configured():
+        ensure_admin_users()
 
     if arguments.once:
         return 0 if run_check_safely(totp) else 1
