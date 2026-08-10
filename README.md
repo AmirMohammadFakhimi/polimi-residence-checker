@@ -94,14 +94,14 @@ table directly. The checker accepts that path as well.
 
 ## Project files
 
-| File | Purpose |
-| --- | --- |
-| `checker.py` | Browser automation, scheduling, Telegram controls, and notifications |
-| `requirements.txt` | Pinned Python dependencies |
-| `.env.example` | Safe configuration template |
-| `.env` | Local credentials and settings; never committed |
-| `.gitignore` | Excludes secrets, state, caches, logs, OS files, and IDE files |
-| `.bot_state.json` | Automatically created local bot state |
+| File               | Purpose                                                              |
+|--------------------|----------------------------------------------------------------------|
+| `checker.py`       | Browser automation, scheduling, Telegram controls, and notifications |
+| `requirements.txt` | Pinned Python dependencies                                           |
+| `.env.example`     | Safe configuration template                                          |
+| `.env`             | Local credentials and settings; never committed                      |
+| `.gitignore`       | Excludes secrets, state, caches, logs, OS files, and IDE files       |
+| `.bot_state.json`  | Automatically created local bot state                                |
 
 `.bot_state.json` contains the learned residence catalog, registered private
 chats, their monitoring and delivery preferences, Telegram interface versions,
@@ -184,20 +184,20 @@ TELEGRAM_CHAT_IDS=
 
 ### Configuration reference
 
-| Variable                        | Required | Description                                                                                                |
-|---------------------------------|----------|------------------------------------------------------------------------------------------------------------|
-| `POLIMI_USERNAME`               | Yes      | Polimi person code                                                                                         |
-| `POLIMI_PASSWORD`               | Yes      | Polimi account password                                                                                    |
-| `POLIMI_TOTP_URI`               | Yes      | Complete `otpauth://totp/...` URI                                                                          |
-| `ACADEMIC_YEAR`                 | No       | Target year in consecutive `YYYY/YYYY` format; default `2026/2027`                                         |
-| `CHECK_START_HOUR`              | No       | Tehran-time anchor for interval mode; blank means check immediately at startup                             |
-| `CHECK_INTERVAL_HOURS`          | No       | Hours between scheduled starts; default `12`                                                               |
-| `SUBSCRIBER_NOTIFICATIONS_ENABLED` | No    | `false` suppresses all notifications to chats outside `TELEGRAM_CHAT_IDS`; default `true`                  |
-| `DELAYED_NOTIFICATIONS_ENABLED` | No       | `true` delays non-administrator notifications; `false` sends due notifications immediately; default `true` |
-| `NOTIFICATION_DELAY_MINUTES`    | No       | Delay for non-administrator notifications; finite number of minutes, zero or more; default `5`             |
-| `INCLUDE_RESIDENCE_NOTICE_PAGE` | No       | Allow the additional University residences declaration; default `true`                                     |
-| `TELEGRAM_BOT_TOKEN`            | No       | Telegram bot token                                                                                         |
-| `TELEGRAM_CHAT_IDS`             | No       | Comma-separated administrator numeric private-chat IDs                                                     |
+| Variable                           | Required | Description                                                                                                |
+|------------------------------------|----------|------------------------------------------------------------------------------------------------------------|
+| `POLIMI_USERNAME`                  | Yes      | Polimi person code                                                                                         |
+| `POLIMI_PASSWORD`                  | Yes      | Polimi account password                                                                                    |
+| `POLIMI_TOTP_URI`                  | Yes      | Complete `otpauth://totp/...` URI                                                                          |
+| `ACADEMIC_YEAR`                    | No       | Target year in consecutive `YYYY/YYYY` format; default `2026/2027`                                         |
+| `CHECK_START_HOUR`                 | No       | Tehran-time anchor for interval mode; blank means check immediately at startup                             |
+| `CHECK_INTERVAL_HOURS`             | No       | Hours between scheduled starts; default `12`                                                               |
+| `SUBSCRIBER_NOTIFICATIONS_ENABLED` | No       | `false` suppresses all outgoing messages to chats outside `TELEGRAM_CHAT_IDS`; default `true`              |
+| `DELAYED_NOTIFICATIONS_ENABLED`    | No       | `true` delays non-administrator notifications; `false` sends due notifications immediately; default `true` |
+| `NOTIFICATION_DELAY_MINUTES`       | No       | Delay for non-administrator notifications; finite number of minutes, zero or more; default `5`             |
+| `INCLUDE_RESIDENCE_NOTICE_PAGE`    | No       | Allow the additional University residences declaration; default `true`                                     |
+| `TELEGRAM_BOT_TOKEN`               | No       | Telegram bot token                                                                                         |
+| `TELEGRAM_CHAT_IDS`                | No       | Comma-separated administrator numeric private-chat IDs                                                     |
 
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_IDS` must either both be set or both be
 left blank.
@@ -389,7 +389,8 @@ residences.
 
 - Configured administrators receive due scheduled availability alerts first.
 - With `SUBSCRIBER_NOTIFICATIONS_ENABLED=false`, nobody outside
-  `TELEGRAM_CHAT_IDS` receives notifications, regardless of personal settings.
+  `TELEGRAM_CHAT_IDS` receives alerts, replies, controls, message edits, or
+  callback responses, regardless of personal settings.
 - Other enabled users receive due alerts after `NOTIFICATION_DELAY_MINUTES`
   when `DELAYED_NOTIFICATIONS_ENABLED=true`.
 - With `DELAYED_NOTIFICATIONS_ENABLED=false`, all due alerts are sent

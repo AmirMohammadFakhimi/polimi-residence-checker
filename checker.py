@@ -1605,7 +1605,7 @@ def interval_hours_text(multiplier):
         hours = float(CHECK_INTERVAL_HOURS) * multiplier
     except ValueError:
         return f"{multiplier}× the system interval"
-    return f"{hours:g} hours"
+    return f"{hours:g} {count_label(hours, 'hour')}"
 
 
 def notification_settings_keyboard(enabled, multiplier):
@@ -1654,34 +1654,26 @@ def notification_settings_text(chat_id, notice=""):
     ]
     if notice:
         lines.extend([notice, ""])
-    lines.extend(
-        [
-            f"Notifications: {'🔔 On' if enabled else '🔕 Off'}",
-            (
-                f"Interval: every {multiplier} system "
-                f"{count_label(multiplier, 'check')} ({interval_hours_text(multiplier)})"
-            ),
-            "",
-            (
-                "The website is still checked only on the global schedule. "
-                "Your interval changes only which completed checks are sent to you."
-            ),
-        ]
-    )
+    lines.append(f"Notifications: {'🔔 On' if enabled else '🔕 Off'}")
     if is_admin_chat(chat_id):
         lines.extend(
             [
+                (
+                    f"Interval: every {multiplier} system "
+                    f"{count_label(multiplier, 'check')} "
+                    f"({interval_hours_text(multiplier)})"
+                ),
+                "",
+                (
+                    "The website is still checked only on the global schedule. "
+                    "Your interval changes only which completed checks are sent to you."
+                ),
                 "",
                 "🔐 Administrator alerts are sent immediately when they are due.",
             ]
         )
-    elif not subscriber_notifications_enabled():
-        lines.extend(
-            [
-                "",
-                "⏸ Subscriber notifications are currently disabled by the administrator.",
-            ]
-        )
+    else:
+        lines.append(f"Notification interval: every {interval_hours_text(multiplier)}")
     return "\n".join(lines)
 
 
@@ -1710,13 +1702,18 @@ def telegram_help_text(chat_id):
             "",
             f"{BUTTON_HELP}",
             "Show this explanation again.",
-            "",
-            (
-                "🔐 Check now and SOL list refresh are available only to "
-                "configured administrators."
-            ),
         ]
     )
+    if is_admin_chat(chat_id):
+        lines.extend(
+            [
+                "",
+                (
+                    "🔐 Check now and SOL list refresh are available only to "
+                    "configured administrators."
+                ),
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -1742,6 +1739,8 @@ def telegram_api_call(method, parameters, timeout_seconds=20):
 
 def send_telegram(chat_id, message, reply_markup=None):
     if not (TELEGRAM_BOT_TOKEN and chat_id):
+        return False
+    if not is_admin_chat(chat_id) and not subscriber_notifications_enabled():
         return False
 
     parameters = {"chat_id": chat_id, "text": message}
@@ -1772,6 +1771,8 @@ def send_telegram(chat_id, message, reply_markup=None):
 
 
 def edit_telegram_message(chat_id, message_id, message, reply_markup):
+    if not is_admin_chat(chat_id) and not subscriber_notifications_enabled():
+        return False
     parameters = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1889,13 +1890,14 @@ def authorized_telegram_action(update):
             or not isinstance(message_id, int)
         ):
             return None
+        is_admin = is_admin_chat(chat_id)
         return {
             "kind": "callback",
             "callback_id": callback_id,
             "chat_id": chat_id,
             "message_id": message_id,
             "data": data,
-            "is_admin": is_admin_chat(chat_id),
+            "is_admin": is_admin,
             "source": source,
         }
 
@@ -1943,6 +1945,28 @@ def callback_id_from_update(update):
     return callback_id if isinstance(callback_id, str) and callback_id else None
 
 
+def private_telegram_identity(update):
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        source = callback.get("from")
+        message = callback.get("message")
+    else:
+        message = update.get("message")
+        source = message.get("from") if isinstance(message, dict) else None
+    if not isinstance(source, dict) or not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict) or chat.get("type") != "private":
+        return None
+    chat_id = str(chat.get("id"))
+    if (
+        re.fullmatch(r"[0-9]+", chat_id) is None
+        or chat_id != str(source.get("id"))
+    ):
+        return None
+    return chat_id, source
+
+
 def telegram_action_listener():
     offset = telegram_update_offset()
     queued_update_ids = set()
@@ -1970,6 +1994,18 @@ def telegram_action_listener():
                     or update_id < offset
                     or update_id in queued_update_ids
                 ):
+                    continue
+
+                identity = private_telegram_identity(update)
+                if (
+                    identity is not None
+                    and not is_admin_chat(identity[0])
+                    and not subscriber_notifications_enabled()
+                ):
+                    register_telegram_user(*identity)
+                    TELEGRAM_ACTION_QUEUE.put((update_id, None))
+                    queued_update_ids.add(update_id)
+                    queued_new_update = True
                     continue
 
                 action = authorized_telegram_action(update)
@@ -2070,6 +2106,8 @@ def telegram_message_chunks(message):
 def send_notification(chat_id, message, description, reply_markup=None):
     if not telegram_configured():
         log(f"Telegram is not configured; {description} was not sent.")
+        return False
+    if not is_admin_chat(chat_id) and not subscriber_notifications_enabled():
         return False
     if reply_markup is None:
         reply_markup = main_menu_keyboard(chat_id)
@@ -2543,20 +2581,22 @@ def ensure_telegram_controls():
     with BOT_STATE_LOCK:
         chat_ids = list(read_bot_state_unlocked()["users"])
     for chat_id in chat_ids:
+        if not is_admin_chat(chat_id) and not subscriber_notifications_enabled():
+            continue
         if telegram_ui_version(chat_id) >= TELEGRAM_UI_VERSION:
             continue
-    if send_notification(
+        if send_notification(
             chat_id,
-        "\n".join(
-            [
-                "🤖 POLIMI RESIDENCE CHECKER",
-                "",
-                "✅ CONTROLS READY",
-                "Use the buttons at the bottom of this chat.",
-            ]
-        ),
-        "button setup",
-    ):
+            "\n".join(
+                [
+                    "🤖 POLIMI RESIDENCE CHECKER",
+                    "",
+                    "✅ CONTROLS READY",
+                    "Use the buttons at the bottom of this chat.",
+                ]
+            ),
+            "button setup",
+        ):
             save_current_telegram_ui_version(chat_id)
 
 
@@ -2695,7 +2735,7 @@ def handle_telegram_action(action, totp):
                 action["message_id"],
                 catalog,
                 watched,
-                "🔐 Only administrators can refresh the list from SOL.",
+                "🔐 This action is not available.",
             )
             return ran_check
         refresh_succeeded = run_check_safely(
